@@ -87,7 +87,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             if _use_aiter:
                 # keep the weight as (N, K)
                 layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)), requires_grad=False
+                    shuffle_weight(weight, (16, 16)).t(), requires_grad=False
                 )
                 # FP8HIPB need to keep the weight as (K, N)
                 if get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB"):
