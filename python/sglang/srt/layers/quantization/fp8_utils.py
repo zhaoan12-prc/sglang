@@ -598,8 +598,7 @@ def apply_fp8_linear(
         num_token_padding = output_padding
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             num_token_padding = None
-        _scaled_fp8_quant = scaled_fp8_quant if _is_cuda else ops.scaled_fp8_quant
-        qinput, x_scale = _scaled_fp8_quant(
+        qinput, x_scale = scaled_fp8_quant(
             input_2d,
             input_scale,
             num_token_padding=num_token_padding,
