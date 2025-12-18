@@ -13,6 +13,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    apply_fp8_ptpc_linear,
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
@@ -94,14 +95,7 @@ class QuarkW8A8Fp8(QuarkScheme):
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
             else:
                 weight_scale = layer.weight_scale.data
-            if self.per_token:
-                weight_scale = weight_scale.view(-1, 1)
-            if _use_aiter:
-                layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)).t(), requires_grad=False
-                )
-            else:
-                layer.weight = Parameter(weight.t(), requires_grad=False)
+
             # required by torch.compile to be torch.nn.Parameter
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
@@ -113,6 +107,16 @@ class QuarkW8A8Fp8(QuarkScheme):
             layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         else:
             layer.input_scale = None
+
+        # Final weight processing for aiter backend (same as compressed_tensors)
+        if _use_aiter:
+            # keep the weight as (N, K) for aiter with shuffle
+            layer.weight = Parameter(
+                shuffle_weight(weight, layout=(16, 16)), requires_grad=False
+            )
+        else:
+            # keep the weight as (K, N) for non-aiter
+            layer.weight = Parameter(weight.t(), requires_grad=False)
 
     def create_weights(
         self,
@@ -174,13 +178,36 @@ class QuarkW8A8Fp8(QuarkScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
-        return apply_fp8_linear(
-            x,
-            layer.weight,
-            layer.weight_scale,
-            input_scale=layer.input_scale,
-            bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
-            use_per_token_if_dynamic=self.per_token,
-        )
+        if _use_aiter:
+            if isinstance(x, tuple):
+                # PTPC: x is (quantized_tensor, per_token_scale)
+                return apply_fp8_ptpc_linear(
+                    input=x[0],
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    input_scale=x[1],
+                    bias=bias,
+                    use_per_token_if_dynamic=True,
+                    compressed_tensor_quant=True,
+                )
+            else:
+                # Non-tuple: use layer.input_scale
+                return apply_fp8_ptpc_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    input_scale=layer.input_scale,
+                    bias=bias,
+                    use_per_token_if_dynamic=True,
+                    compressed_tensor_quant=True,
+                )
+        else:
+            return apply_fp8_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                use_per_token_if_dynamic=self.per_token,
+            )
