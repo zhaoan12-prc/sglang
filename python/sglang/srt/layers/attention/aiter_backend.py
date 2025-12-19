@@ -979,6 +979,31 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         else:
+            # Some models intentionally skip computing K/V for certain layers (e.g. KV sharing)
+            # or for optional cross-attention (no encoder states). In those cases, RadixAttention
+            # forwards k/v as None. For backend kernels that require materialized k/v, we
+            # reconstruct them from the KV cache using kv_indices; if there is no KV at all,
+            # we return a zero output (i.e. "no attention contribution").
+            if (k is None) or (v is None):
+                if (k is None) != (v is None):
+                    raise ValueError(
+                        f"AiterBackend.forward_extend expects k and v both None or both non-None, got {k is None=}, {v is None=}."
+                    )
+
+                # Total KV tokens for this batch are stored at the last kv_indptr entry.
+                # kv_indices may include extra padding for CUDA-graph safety; we slice by token count.
+                kv_token_num = int(self.forward_metadata.kv_indptr[-1].item())
+                if kv_token_num == 0:
+                    return q.new_zeros((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+
+                kv_indices = self.forward_metadata.kv_indices[:kv_token_num].to(torch.int64)
+                k = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).index_select(
+                    0, kv_indices
+                )
+                v = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).index_select(
+                    0, kv_indices
+                )
+
             if USING_PRESHUFFLE_LAYOUT:
                 import aiter
                 bs0 = forward_batch.batch_size + 1
@@ -989,7 +1014,12 @@ class AiterAttnBackend(AttentionBackend):
                     k=k,
                     v=v,
                     cu_seqlens_q=self.qo_indptr[:bs0],
-                    cu_seqlens_k=self.qo_indptr[:bs0],
+                    # If k/v were reconstructed from KV cache, their ragged lengths follow kv_indptr.
+                    cu_seqlens_k=(
+                        self.forward_metadata.kv_indptr[:bs0]
+                        if (k is not None and v is not None and (q.shape[0] != k.shape[0]))
+                        else self.qo_indptr[:bs0]
+                    ),
                     max_seqlen_q=self.forward_metadata.max_q_len,
                     max_seqlen_k=self.forward_metadata.max_kv_len,
                     softmax_scale=self.scale,
@@ -1017,6 +1047,8 @@ class AiterAttnBackend(AttentionBackend):
             
             # Helper function to quantize tensor to FP8 if not already FP8
             def quantize_to_fp8_if_needed(tensor):
+                if tensor is None:
+                    raise ValueError("quantize_to_fp8_if_needed got None tensor (k/v should have been materialized).")
                 return tensor if tensor.dtype in FP8_DTYPES else per_tensor_quant(
                     tensor, scale=FP8_SCALE, quant_dtype=dtypes.fp8
                 )[0]
