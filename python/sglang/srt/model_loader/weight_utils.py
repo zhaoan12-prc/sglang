@@ -1199,5 +1199,6 @@ def narrow_padded_param_and_loaded_weight(
     )
 
     param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
-
+    if loaded_weight.ndim == 1 and param_data.ndim == 2:
+        loaded_weight = loaded_weight.unsqueeze(-1)
     return param_data, loaded_weight

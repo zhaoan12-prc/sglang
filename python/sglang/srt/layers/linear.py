@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         QuantizationConfig,
         QuantizeMethodBase,
     )
+import sys
 
 _is_hip = is_hip()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
@@ -49,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
+    "QuarkLinearMethod",
     "AWQMarlinLinearMethod",
     "AWQLinearMethod",
     "AWQLinearAscendMethod",
@@ -404,6 +406,7 @@ class ColumnParallelLinear(LinearBase):
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
+        print(f"DEBUG LINEAR: start ColumnParallelLinear weight_loader_v2, loaded_shard_id: {loaded_shard_id}", file=sys.stderr, flush=True)
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
@@ -710,6 +713,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[int] = None,
     ):
+        print(f"DEBUG LINEAR: start MergedColumnParallelLinear weight_loader_v2, loaded_shard_id: {loaded_shard_id}", file=sys.stderr, flush=True)
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
                 param.load_merged_column_weight(
@@ -943,6 +947,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[str] = None,
     ):
+        print(f"DEBUG LINEAR: start QKVParallelLinear weight_loader_v2, loaded_shard_id: {loaded_shard_id}", file=sys.stderr, flush=True)
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
                 param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
@@ -984,6 +989,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[str] = None,
     ):
+        print(f"DEBUG LINEAR: start weight_loader, loaded_shard_id: {loaded_shard_id}", file=sys.stderr, flush=True)
 
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
@@ -1187,6 +1193,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                     "for all partitions."
                 )
 
+        if param_data.ndim == 2 and loaded_weight.ndim == 1:
+            loaded_weight = loaded_weight.unsqueeze(-1)
+            print(f"DEBUG LINEAR: loaded_weight.shape: {loaded_weight.shape}", file=sys.stderr, flush=True)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -1263,6 +1272,7 @@ class RowParallelLinear(LinearBase):
                 else self.weight_loader
             ),
         )
+        print(f"DEBUG LINEAR: self.quant_method.__class__.__name__: {self.quant_method.__class__.__name__}", file=sys.stderr, flush=True)
 
         if bias:
             self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
@@ -1333,7 +1343,11 @@ class RowParallelLinear(LinearBase):
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
-
+        print(f"DEBUG LINEAR: param_data.shape: {param_data.shape}", file=sys.stderr, flush=True)
+        print(f"DEBUG LINEAR: loaded_weight.shape: {loaded_weight.shape}", file=sys.stderr, flush=True)
+        if param_data.ndim == 2 and loaded_weight.ndim == 1:
+            loaded_weight = loaded_weight.unsqueeze(-1)
+            print(f"DEBUG LINEAR: loaded_weight.shape: {loaded_weight.shape}", file=sys.stderr, flush=True)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -1341,6 +1355,7 @@ class RowParallelLinear(LinearBase):
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
+        print(f"DEBUG LINEAR: start RowParallelLinear weight_loader_v2", file=sys.stderr, flush=True)
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)

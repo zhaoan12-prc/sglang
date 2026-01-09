@@ -848,6 +848,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        print("DEBUG: start load_weights", flush=True)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -948,6 +949,8 @@ class Qwen3MoeForCausalLM(nn.Module):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
+                        if loaded_weight.ndim == 1 and param.data.ndim == 2:
+                            loaded_weight = loaded_weight.unsqueeze(-1)
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")

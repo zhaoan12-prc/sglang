@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-
+import sys
 from typing import Any, Callable, Optional, cast
 
 import torch
@@ -10,6 +10,7 @@ from sglang.srt.layers.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import AiterHipblaslt
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -83,40 +84,62 @@ class QuarkW8A8Fp8(QuarkScheme):
         # If channelwise, scales are already lined up, so just transpose.
         elif self.weight_qscheme == "per_channel":
             weight = layer.weight
-
-            if _is_fp8_fnuz:
+            print(f"enter QUARK PTPC FP8", file=sys.stderr, flush=True)
+            if is_fp8_fnuz():
                 input_scale = getattr(layer, "input_scale", None)
+
                 weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
                     weight=weight,
                     weight_scale=layer.weight_scale,
                     input_scale=input_scale,
                 )
+                if weight is not None:
+                    print(f"DEBUG QUARK: weight.shape: {weight.shape}", file=sys.stderr, flush=True)
+                if weight_scale is not None:
+                    print(f"DEBUG QUARK: weight_scale.shape: {weight_scale.shape}", file=sys.stderr, flush=True)
+                if input_scale is not None:
+                    print(f"DEBUG QUARK: input_scale.shape: {input_scale.shape}", file=sys.stderr, flush=True)
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
             else:
                 weight_scale = layer.weight_scale.data
 
+            if _use_aiter:
+                # keep the weight as (N, K)
+                layer.weight = Parameter(
+                    shuffle_weight(weight, (16, 16)).t(), requires_grad=False
+                )
+                # FP8HIPB need to keep the weight as (K, N)
+                if get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB"):
+                    AiterHipblaslt._initialize_hipblaslt()
+                    layout = (16, 16)
+                    if AiterHipblaslt.can_shuffle(
+                        weight.shape[0], weight.shape[1], layout
+                    ):
+                        shuffled_weight = shuffle_weight(weight, layout).t()
+                        self._aiter_trans_weight = False
+                    else:
+                        shuffled_weight = weight
+                        self._aiter_trans_weight = True
+
+                    layer.weight = Parameter(shuffled_weight.data, requires_grad=False)
+                    weight_scale = weight_scale.t()
+            else:
+                # keep the weight as (K, N)
+                layer.weight = Parameter(weight.t(), requires_grad=False)
+
             # required by torch.compile to be torch.nn.Parameter
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
         else:
-            raise ValueError(f"Unknown quantization scheme {self.weight_qscheme}")
+            raise ValueError(f"Unknown quantization strategy {self.strategy}")
 
         # INPUT SCALE
-        if self.is_static_input_scheme:
+        if self.is_static_input_scheme and hasattr(layer, "input_scale"):
             layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         else:
             layer.input_scale = None
 
-        # Final weight processing for aiter backend (same as compressed_tensors)
-        if _use_aiter:
-            # keep the weight as (N, K) for aiter with shuffle
-            layer.weight = Parameter(
-                shuffle_weight(weight, layout=(16, 16)), requires_grad=False
-            )
-        else:
-            # keep the weight as (K, N) for non-aiter
-            layer.weight = Parameter(weight.t(), requires_grad=False)
 
     def create_weights(
         self,
@@ -146,10 +169,12 @@ class QuarkW8A8Fp8(QuarkScheme):
         # WEIGHT SCALE
         if self.weight_qscheme == "per_channel":
             weight_scale = ChannelQuantScaleParameter(
-                data=torch.empty((sum(output_partition_sizes)), dtype=torch.float32),
+                data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
                 output_dim=0,
                 weight_loader=weight_loader,
             )
+            # Mark for shape fix during loading
+            set_weight_attrs(weight_scale, {"scale_dim_fix": True})
         else:
             assert self.weight_qscheme == "per_tensor"
             weight_scale = PerTensorScaleParameter(

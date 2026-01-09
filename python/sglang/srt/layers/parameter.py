@@ -216,7 +216,8 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 loaded_weight = loaded_weight.narrow(
                     self.output_dim, shard_id * shard_size, shard_size
                 )
-
+        if loaded_weight.ndim == 1 and param_data.ndim == 2:
+            loaded_weight = loaded_weight.unsqueeze(-1)
         assert (
             param_data.shape == loaded_weight.shape
         ), f"{param_data.shape=}, {loaded_weight.shape=}"
@@ -261,7 +262,8 @@ class RowvLLMParameter(BasevLLMParameter):
                     self.input_dim,
                     shard_size,
                 )
-
+                if loaded_weight.ndim == 1 and param_data.ndim == 2:
+                    loaded_weight = loaded_weight.unsqueeze(-1)
                 assert param_data.shape == loaded_weight.shape
                 param_data.copy_(loaded_weight)
 

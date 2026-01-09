@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -471,28 +472,53 @@ class QuarkW8A8FP8MoEMethod(QuarkMoEMethod):
 
         moe_runner_config = self.moe_runner_config
 
-        if (
+        use_rocm_fused = (
             _use_aiter
             and self.is_weight_per_channel
             and moe_runner_config.apply_router_weight_on_input
-        ):
+        )
+        if _use_aiter:
             topk_weights, topk_ids, _ = topk_output
-            output = rocm_fused_experts_tkw1(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                activation=moe_runner_config.activation,
-                apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
-                use_fp8_w8a8=True,
-                per_channel_quant=self.is_weight_per_channel,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a1_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-            )
-            return StandardCombineInput(hidden_states=output)
+            if _is_hip:
+                # aiter's moe_sorting requires topk_weights to be FP32 on ROCm
+                topk_weights = topk_weights.to(torch.float32)
+
+            if use_rocm_fused:
+                output = rocm_fused_experts_tkw1(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    activation=moe_runner_config.activation,
+                    apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+                    use_fp8_w8a8=True,
+                    per_channel_quant=self.is_weight_per_channel,
+                    w1_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    a1_scale=layer.w13_input_scale,
+                    a2_scale=layer.w2_input_scale,
+                )
+                return StandardCombineInput(hidden_states=output)
+            else:
+                # Match CompressedTensorsW8A8Fp8MoEMethod: use aiter fused_moe when enabled.
+                return fused_moe(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    quant_type=QuantType.per_Token,
+                    w1_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    a1_scale=layer.w13_input_scale,
+                    a2_scale=layer.w2_input_scale,
+                    activation=(
+                        ActivationType.Silu
+                        if moe_runner_config.activation == "silu"
+                        else ActivationType.Gelu
+                    ),
+                )
         else:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,

@@ -1,6 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
-
+import sys
 from typing import Callable, List, Optional
 
 import torch
@@ -70,7 +70,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         # If channelwise, scales are already lined up, so just transpose.
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight = layer.weight
-
+            print(f"enter ptpc FP8", file=sys.stderr, flush=True)
             if is_fp8_fnuz():
                 input_scale = getattr(layer, "input_scale", None)
 
@@ -79,6 +79,13 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                     weight_scale=layer.weight_scale,
                     input_scale=input_scale,
                 )
+                if weight is not None:
+                    print(f"DEBUG COMPRESSED: weight.shape: {weight.shape}", file=sys.stderr, flush=True)
+                if weight_scale is not None:
+                    print(f"DEBUG COMPRESSED: weight_scale.shape: {weight_scale.shape}", file=sys.stderr, flush=True)
+                if input_scale is not None:
+                    print(f"DEBUG COMPRESSED: input_scale.shape: {input_scale.shape}", file=sys.stderr, flush=True)
+
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
             else:
