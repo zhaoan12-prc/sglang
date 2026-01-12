@@ -14,7 +14,7 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -374,7 +374,7 @@ class QuarkW8A8FP8MoEMethod(QuarkMoEMethod):
             )
 
         if _is_fp8_fnuz:
-            # Normalize the weights and scales
+            # ALIGNED WITH COMPRESSOR: remove _QUARK_SKIP_FNUZ_NORMALIZE branch
             w13_weight, w13_weight_scale, w13_input_scale = (
                 normalize_e4m3fn_to_e4m3fnuz(
                     layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
@@ -423,32 +423,84 @@ class QuarkW8A8FP8MoEMethod(QuarkMoEMethod):
             layer.w13_weight_scale = torch.nn.Parameter(
                 max_w13_scales, requires_grad=False
             )
-        elif self.weight_qscheme == "per_channel":
+        
+        # ALIGNED WITH COMPRESSOR: add last dimension for per_channel scales
+        if self.weight_qscheme == "per_channel":
             layer.w13_weight_scale = torch.nn.Parameter(
                 layer.w13_weight_scale.unsqueeze(-1), requires_grad=False
             )
             layer.w2_weight_scale = torch.nn.Parameter(
                 layer.w2_weight_scale.unsqueeze(-1), requires_grad=False
             )
-        else:
-            raise ValueError(
-                f"Unsupported weight quantization strategy: {self.weight_qscheme}."
-            )
 
-        if (
-            _use_aiter
-            and self.is_weight_per_channel
-            and self.moe_runner_config.apply_router_weight_on_input
-        ):
+        # ALIGNED WITH COMPRESSOR: aiter shuffle with padding
+        if _use_aiter:
+            padding_size = get_int_env_var("AITER_MOE_PADDING_SIZE")
+
+            N = layer.w2_weight.shape[-1]
+            if padding_size:
+                pad_size = (padding_size - (N % padding_size)) % padding_size
+            else:
+                pad_size = 0
+
+            if self.weight_qscheme == "per_channel":
+                # pad w13_weight_scale
+                with torch.no_grad():
+                    part1 = layer.w13_weight_scale.data[:, :N, :]
+                    part2 = layer.w13_weight_scale.data[:, N:, :]
+                    # 1. pad part1
+                    part1_padded = torch.nn.functional.pad(
+                        part1,
+                        (0, 0, 0, pad_size, 0, 0),  # pad on right on dim 1
+                        mode="constant",
+                        value=0,
+                    )
+                    # 2. pad part2
+                    part2_padded = torch.nn.functional.pad(
+                        part2,
+                        (0, 0, 0, pad_size, 0, 0),  # pad on right on dim 1
+                        mode="constant",
+                        value=0,
+                    )
+
+                    # 3. concat part1 and part2
+                    padded_w13_weight_scale = torch.cat(
+                        [part1_padded, part2_padded], dim=1
+                    )
+                    layer.w13_weight_scale = torch.nn.Parameter(
+                        padded_w13_weight_scale,
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+
             with torch.no_grad():
                 # Pre-shuffle weights
+                part1 = layer.w13_weight.data[:, :N, :]
+                part2 = layer.w13_weight.data[:, N:, :]
+
+                # 1. pad part1
+                part1_padded = torch.nn.functional.pad(
+                    part1, (0, 0, 0, pad_size, 0, 0), mode="constant", value=0
+                )
+
+                # 2. pad part2
+                part2_padded = torch.nn.functional.pad(
+                    part2, (0, 0, 0, pad_size, 0, 0), mode="constant", value=0
+                )
+
+                # 3. concate
+                padded_w13_wight = torch.cat([part1_padded, part2_padded], dim=1)
+
                 layer.w13_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w13_weight.data, (16, 16)),
+                    shuffle_weight(padded_w13_wight, (16, 16)),
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
+                padded_w2_wight = torch.nn.functional.pad(
+                    layer.w2_weight.data, (0, pad_size, 0, 0, 0, 0), "constant", 0
+                )
                 layer.w2_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w2_weight.data, (16, 16)),
+                    shuffle_weight(padded_w2_wight, (16, 16)),
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()

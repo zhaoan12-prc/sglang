@@ -84,7 +84,6 @@ class QuarkW8A8Fp8(QuarkScheme):
         # If channelwise, scales are already lined up, so just transpose.
         elif self.weight_qscheme == "per_channel":
             weight = layer.weight
-            print(f"enter QUARK PTPC FP8", file=sys.stderr, flush=True)
             if is_fp8_fnuz():
                 input_scale = getattr(layer, "input_scale", None)
 
@@ -93,12 +92,7 @@ class QuarkW8A8Fp8(QuarkScheme):
                     weight_scale=layer.weight_scale,
                     input_scale=input_scale,
                 )
-                if weight is not None:
-                    print(f"DEBUG QUARK: weight.shape: {weight.shape}", file=sys.stderr, flush=True)
-                if weight_scale is not None:
-                    print(f"DEBUG QUARK: weight_scale.shape: {weight_scale.shape}", file=sys.stderr, flush=True)
-                if input_scale is not None:
-                    print(f"DEBUG QUARK: input_scale.shape: {input_scale.shape}", file=sys.stderr, flush=True)
+
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
             else:
@@ -233,6 +227,6 @@ class QuarkW8A8Fp8(QuarkScheme):
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
-                cutlass_fp8_supported=self.cutlass_fp8_supported,
-                use_per_token_if_dynamic=self.per_token,
+                use_per_token_if_dynamic=True,
+                compressed_tensor_quant=True,
             )
