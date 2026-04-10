@@ -25,6 +25,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.utils.debug_dump import dump_tensor, dump_tensor_enabled
+
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -232,9 +234,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ]
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
+        _li = getattr(self, '_dump_layer_idx', -1)
+        _dump = dump_tensor_enabled()
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
+            if _dump:
+                dump_tensor(shared_output, f"layer{_li}.moe.shared_expert_out", _li)
             if self.shared_expert_gate is not None:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
@@ -249,14 +255,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         F.sigmoid(self.shared_expert_gate(hidden_states))
                         * shared_output
                     )
+                if _dump:
+                    dump_tensor(shared_output, f"layer{_li}.moe.shared_expert_gated", _li)
 
         return shared_output
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        _li = getattr(self, '_dump_layer_idx', -1)
+        _dump = dump_tensor_enabled()
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
+            if _dump:
+                dump_tensor(router_logits, f"layer{_li}.moe.router_logits", _li)
             shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -266,23 +278,41 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     layer_id=self.layer_id,
                 ),
             )
+            if _dump and hasattr(topk_output, 'topk_weights'):
+                dump_tensor(topk_output.topk_weights, f"layer{_li}.moe.topk_weights", _li)
+                dump_tensor(topk_output.topk_ids, f"layer{_li}.moe.topk_ids", _li)
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        if _dump:
+            dump_tensor(final_hidden_states, f"layer{_li}.moe.experts_out", _li)
 
         if shared_output is not None:
             final_hidden_states.add_(shared_output)
 
+        if _dump:
+            dump_tensor(final_hidden_states, f"layer{_li}.moe.out", _li)
+
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
+        _li = getattr(self, '_dump_layer_idx', -1)
+        _dump = dump_tensor_enabled()
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        if _dump:
+            dump_tensor(router_logits, f"layer{_li}.moe.router_logits", _li)
         topk_output = self.topk(hidden_states, router_logits)
-        return self.experts(hidden_states, topk_output)
+        if _dump and hasattr(topk_output, 'topk_weights'):
+            dump_tensor(topk_output.topk_weights, f"layer{_li}.moe.topk_weights", _li)
+            dump_tensor(topk_output.topk_ids, f"layer{_li}.moe.topk_ids", _li)
+        experts_out = self.experts(hidden_states, topk_output)
+        if _dump:
+            dump_tensor(experts_out, f"layer{_li}.moe.experts_out", _li)
+        return experts_out
 
     def forward_normal_dual_stream(
         self,
@@ -307,8 +337,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        use_deepep = get_moe_a2a_backend().is_deepep()
+        print(
+            "[SGLANG_MOE_TRACE] "
+            f"layer={self.layer_id} block={self.__class__.__name__} "
+            f"path={'deepep' if use_deepep else 'normal'} "
+            f"experts_impl={self.experts.__class__.__name__} "
+            f"topk_impl={self.topk.__class__.__name__}"
+        )
 
-        if get_moe_a2a_backend().is_deepep():
+        if use_deepep:
             return self._forward_deepep(hidden_states, forward_batch)
 
         if (
@@ -331,6 +369,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states += shared_output
         if self.tp_size > 1 and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        if dump_tensor_enabled():
+            _li = getattr(self, '_dump_layer_idx', -1)
+            dump_tensor(final_hidden_states, f"layer{_li}.moe.out", _li)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 

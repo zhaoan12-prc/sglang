@@ -814,7 +814,22 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states, residual
                 )
             else:
+                dump_name = getattr(hidden_states, "_sglang_dump_allreduce_name", None)
+                dump_layer_idx = getattr(
+                    hidden_states, "_sglang_dump_allreduce_layer_idx", -1
+                )
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if dump_name is not None:
+                    try:
+                        from sglang.srt.utils.debug_dump import (
+                            dump_tensor,
+                            dump_tensor_enabled,
+                        )
+
+                        if dump_tensor_enabled():
+                            dump_tensor(hidden_states, dump_name, dump_layer_idx)
+                    except Exception:
+                        pass
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)

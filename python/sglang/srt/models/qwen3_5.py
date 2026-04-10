@@ -15,8 +15,9 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from functools import lru_cache
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -77,6 +78,7 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 # Utils
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
+from sglang.srt.utils.debug_dump import dump_tensor, dump_tensor_enabled, dump_tensor_step_begin, dump_tensor_step_end
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -84,6 +86,92 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 cached_get_processor = lru_cache(get_processor)
+
+_DUMP_SEED = int(os.getenv("SGLANG_DUMP_SEED", "20260319"))
+_DUMP_DIR = os.getenv("SGLANG_DUMP_DIR", "/mnt/raid0/zhaoan12/cache/qwen35_moe_tensor/sglang")
+_DUMP_MAX_LAYERS = int(os.getenv("SGLANG_DUMP_MAX_LAYERS", "4"))
+_DUMP_MIDPOINTS_ONLY_GLOBAL_RANK0 = (
+    os.getenv("SGLANG_DUMP_MIDPOINTS_ONLY_GLOBAL_RANK0", "1") == "1"
+)
+_DUMP_RANK0_ONLY_POINTS = {"qkv_proj_out", "attn_module_out", "o_proj_out"}
+_DUMP_POINTS = (
+    "attn_in",
+    "qkv_proj_out",
+    "attn_module_out",
+    "o_proj_out",
+    "attn_out",
+    "residual_attn_out",
+    "moe_in",
+    "moe_out",
+    "residual_moe_out",
+)
+_DUMP_STATE: Dict[str, Union[bool, Dict[str, torch.Tensor]]] = {
+    "done": False,
+    "tensors": {},
+}
+
+
+def _dump_enabled() -> bool:
+    return not bool(_DUMP_STATE["done"])
+
+
+def _should_dump_layer(layer_id: int) -> bool:
+    return 0 <= layer_id < _DUMP_MAX_LAYERS
+
+
+def _is_global_rank0() -> bool:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
+
+def _record_dump_tensor(name: str, tensor: torch.Tensor, layer_id: int) -> None:
+    if not _dump_enabled():
+        return
+    if not _should_dump_layer(layer_id):
+        return
+    if (
+        _DUMP_MIDPOINTS_ONLY_GLOBAL_RANK0
+        and name in _DUMP_RANK0_ONLY_POINTS
+        and not _is_global_rank0()
+    ):
+        return
+
+    saved_tensors = _DUMP_STATE["tensors"]
+    assert isinstance(saved_tensors, dict)
+    tensor_key = f"layer_{layer_id:02d}/{name}"
+    if tensor_key in saved_tensors:
+        return
+
+    saved_tensors[tensor_key] = (
+        tensor.detach().to(torch.bfloat16).contiguous().cpu()
+    )
+    print(
+        "[SGLANG_DUMP] "
+        f"captured name={tensor_key} shape={tuple(tensor.shape)} "
+        f"src_dtype={tensor.dtype} saved_dtype=torch.bfloat16"
+    )
+
+    required = [
+        f"layer_{layer:02d}/{point}"
+        for layer in range(_DUMP_MAX_LAYERS)
+        for point in _DUMP_POINTS
+    ]
+    if all(key in saved_tensors for key in required):
+        os.makedirs(_DUMP_DIR, exist_ok=True)
+        save_path = os.path.join(_DUMP_DIR, f"qwen35_dump_seed{_DUMP_SEED}.pt")
+        torch.save(
+            {
+                "seed": _DUMP_SEED,
+                "saved_dtype": "bfloat16",
+                "max_layers": _DUMP_MAX_LAYERS,
+                "tensor_names": required,
+                "tensors": saved_tensors,
+            },
+            save_path,
+        )
+        _DUMP_STATE["done"] = True
+        print(f"[SGLANG_DUMP] saved={save_path} done=1 (inference continues)")
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -276,14 +364,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        _li = self.layer_id
+        _dump = dump_tensor_enabled()
         seq_len, _ = hidden_states.shape
 
         mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+        _record_dump_tensor("qkv_proj_out", mixed_qkv, _li)
         z, _ = self.in_proj_z(hidden_states)
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
         b, _ = self.in_proj_b(hidden_states)
         a, _ = self.in_proj_a(hidden_states)
 
+        if _dump:
+            dump_tensor(mixed_qkv, f"layer{_li}.linear_attn.mixed_qkv", _li)
+            dump_tensor(z, f"layer{_li}.linear_attn.z", _li)
+            dump_tensor(b, f"layer{_li}.linear_attn.b", _li)
+            dump_tensor(a, f"layer{_li}.linear_attn.a", _li)
+
+        z = z.reshape(z.size(0), -1, self.head_v_dim)
         b = b.contiguous()
         a = a.contiguous()
 
@@ -293,14 +390,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             a=a,
             b=b,
         )
+        _record_dump_tensor("attn_module_out", core_attn_out, _li)
+        if _dump:
+            dump_tensor(core_attn_out, f"layer{_li}.linear_attn.fla_out", _li)
 
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
+        if _dump:
+            dump_tensor(core_attn_out, f"layer{_li}.linear_attn.norm_out", _li)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
+        _record_dump_tensor("o_proj_out", output, _li)
+        if _dump:
+            dump_tensor(output, f"layer{_li}.linear_attn.out_proj", _li)
         return output
 
 
@@ -374,6 +479,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             allow_reduce_scatter=True,
         )
 
+        self.linear_attn._dump_layer_idx = layer_id
+        self.mlp._dump_layer_idx = layer_id
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -381,30 +489,68 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
+        _li = self.layer_id
+        _dump = dump_tensor_enabled()
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
 
+        if _dump:
+            if residual is not None:
+                dump_tensor(residual, f"layer{_li}.input", _li)
+            dump_tensor(hidden_states, f"layer{_li}.input_layernorm_out", _li)
+
         if not forward_batch.forward_mode.is_idle():
+            _record_dump_tensor("attn_in", hidden_states, self.layer_id)
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
             )
 
+        if _dump:
+            dump_tensor(hidden_states, f"layer{_li}.attn_out", _li)
+
         # Fully Connected
+        if _dump:
+            # Ask LayerCommunicator to dump the tensor right after TP all-reduce
+            # (and before post-attention layernorm), aligned with RTP name.
+            hidden_states._sglang_dump_allreduce_name = f"layer{_li}.linear_attn.all_reduce"
+            hidden_states._sglang_dump_allreduce_layer_idx = _li
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        # Dump after attention->MLP communication stage.
+        _record_dump_tensor("attn_out", hidden_states, self.layer_id)
+        if residual is not None:
+            _record_dump_tensor("residual_attn_out", residual, self.layer_id)
+        _record_dump_tensor("moe_in", hidden_states, self.layer_id)
+
+        if _dump:
+            dump_tensor(hidden_states, f"layer{_li}.post_attn_layernorm_out", _li)
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
+        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            print(
+                "[SGLANG_MOE_TRACE] "
+                f"layer={self.layer_id} decoder=linear_attention "
+                f"mlp={self.mlp.__class__.__name__} "
+                f"experts_impl={self.mlp.experts.__class__.__name__}"
+            )
         hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+
+        if _dump:
+            dump_tensor(hidden_states, f"layer{_li}.mlp_out", _li)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        # Dump after layer postprocess communication stage.
+        _record_dump_tensor("moe_out", hidden_states, self.layer_id)
+        if residual is not None:
+            _record_dump_tensor("residual_moe_out", residual, self.layer_id)
 
         return hidden_states, residual
 
@@ -553,6 +699,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         self.alt_stream = alt_stream
 
+        self.mlp._dump_layer_idx = layer_id
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -582,6 +730,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        _li = self.layer_id
+        _dump = dump_tensor_enabled()
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
@@ -593,18 +743,38 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
             gate = gate.reshape(*orig_shape, -1)
+            # Dump pure [q, k, v] without gate to match RTP's qkv_proj_out layout.
+            _record_dump_tensor(
+                "qkv_proj_out", torch.cat([q, k, v], dim=-1), _li
+            )
+            if _dump:
+                dump_tensor(torch.cat([q, k, v], dim=-1), f"layer{_li}.full_attn.qkv_proj_out", _li)
+                dump_tensor(gate, f"layer{_li}.full_attn.gate", _li)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            _record_dump_tensor("qkv_proj_out", qkv, _li)
+            if _dump:
+                dump_tensor(qkv, f"layer{_li}.full_attn.qkv_proj_out", _li)
 
         q, k = self._apply_qk_norm(q, k)
+        if _dump:
+            dump_tensor(torch.cat([q, k], dim=-1), f"layer{_li}.full_attn.qk_norm_out", _li)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
+        _record_dump_tensor("attn_module_out", attn_output, _li)
+        if _dump:
+            dump_tensor(attn_output, f"layer{_li}.full_attn.fmha_out", _li)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
+        _record_dump_tensor("o_proj_out", output, _li)
+        if _dump:
+            dump_tensor(output, f"layer{_li}.full_attn.o_proj_out", _li)
+            if self.attn_output_gate:
+                dump_tensor(output, f"layer{_li}.full_attn.out", _li)
         return output
 
     def forward(
@@ -615,29 +785,64 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
+        _li = self.layer_id
+        _dump = dump_tensor_enabled()
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
 
+        if _dump:
+            if residual is not None:
+                dump_tensor(residual, f"layer{_li}.input", _li)
+            dump_tensor(hidden_states, f"layer{_li}.input_layernorm_out", _li)
+
         if not forward_batch.forward_mode.is_idle():
+            _record_dump_tensor("attn_in", hidden_states, self.layer_id)
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
 
+        if _dump:
+            dump_tensor(hidden_states, f"layer{_li}.attn_out", _li)
+
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        # Dump after attention->MLP communication stage.
+        _record_dump_tensor("attn_out", hidden_states, self.layer_id)
+        if residual is not None:
+            _record_dump_tensor("residual_attn_out", residual, self.layer_id)
+        _record_dump_tensor("moe_in", hidden_states, self.layer_id)
+
+        if _dump:
+            dump_tensor(hidden_states, f"layer{_li}.post_attn_layernorm_out", _li)
+
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
+        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            print(
+                "[SGLANG_MOE_TRACE] "
+                f"layer={self.layer_id} decoder=full_attention "
+                f"mlp={self.mlp.__class__.__name__} "
+                f"experts_impl={self.mlp.experts.__class__.__name__}"
+            )
         hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+
+        if _dump:
+            dump_tensor(hidden_states, f"layer{_li}.mlp_out", _li)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        # Dump after layer postprocess communication stage.
+        _record_dump_tensor("moe_out", hidden_states, self.layer_id)
+        if residual is not None:
+            _record_dump_tensor("residual_moe_out", residual, self.layer_id)
 
         return hidden_states, residual
 
@@ -712,12 +917,17 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        dump_tensor_step_begin()
+        _dump = dump_tensor_enabled()
+
         # Initialize hidden states
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
+            if _dump:
+                dump_tensor(hidden_states, "embedding_out")
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -764,6 +974,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
+        if _dump:
+            dump_tensor(hidden_states, "final_norm_out")
+
+        dump_tensor_step_end()
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
